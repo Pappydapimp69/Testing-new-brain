@@ -1,0 +1,124 @@
+name: Log a training-mode gap
+description: Create a new knowledge gap, or append a session's findings to an existing one. Auto-lands after automated checks — never sets a gap to closed.
+title: "[gap] "
+labels: ["intake:gap"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        This feeds the lighter gap-write path (see gaps/GAP_WRITE_PATH.md). It is
+        sandboxed to the gaps/ folder, append-only, and can never mark a gap
+        closed. Do not include secrets, credentials, or anything not cleared to
+        publish — a gap record is public.
+  - type: dropdown
+    id: operation
+    attributes:
+      label: Operation
+      options:
+        - create
+        - append
+    validations:
+      required: true
+  - type: input
+    id: target
+    attributes:
+      label: "Target gap file (append only — the existing <slug>.md under gaps/)"
+    validations:
+      required: false
+  - type: textarea
+    id: gap
+    attributes:
+      label: "Gap statement (create only — one plain-English sentence)"
+    validations:
+      required: false
+  - type: input
+    id: domain
+    attributes:
+      label: "Domain (create only)"
+    validations:
+      required: false
+  - type: dropdown
+    id: gap-type
+    attributes:
+      label: "Gap type (create only)"
+      description: "fact-lookup (an external fact) · fit (does it work together) · reaction (how it lands on a person)"
+      options:
+        - fact-lookup
+        - fit
+        - reaction
+    validations:
+      required: false
+  - type: input
+    id: origin
+    attributes:
+      label: "Origin (create only — the entry/tag that surfaced it, or 'seed')"
+    validations:
+      required: false
+  - type: textarea
+    id: closure
+    attributes:
+      label: "Closure condition (create only — what would let this gap leave the folder)"
+    validations:
+      required: false
+  - type: dropdown
+    id: status
+    attributes:
+      label: Status
+      description: "This path may set open / accumulating / converging only. It can never set closed."
+      options:
+        - open
+        - accumulating
+        - converging
+    validations:
+      required: true
+  - type: input
+    id: session-date
+    attributes:
+      label: "Session date (YYYY-MM-DD; required for append, optional first session on create)"
+    validations:
+      required: false
+  - type: dropdown
+    id: session-mode
+    attributes:
+      label: Session mode
+      options:
+        - teacher
+        - playmate
+    validations:
+      required: false
+  - type: textarea
+    id: scenario
+    attributes:
+      label: "Scenario / mad-lib (the creative exercise the user was put inside)"
+    validations:
+      required: false
+  - type: textarea
+    id: user-inputs
+    attributes:
+      label: "User inputs (the 1-3 inputs they supplied)"
+    validations:
+      required: false
+  - type: textarea
+    id: artifacts
+    attributes:
+      label: "Artifacts (how many, what each tested — raw material, not kept)"
+    validations:
+      required: false
+  - type: textarea
+    id: steer
+    attributes:
+      label: "Steer / outcome (the yes-no or which-landed signal)"
+    validations:
+      required: false
+  - type: textarea
+    id: mined
+    attributes:
+      label: "Mined (candidate nugget, or 'nothing worth mining') — provenance: Assumed | Verified"
+    validations:
+      required: false
+  - type: textarea
+    id: left-open
+    attributes:
+      label: "Left open (what's still unresolved for the next session)"
+    validations:
+      required: false

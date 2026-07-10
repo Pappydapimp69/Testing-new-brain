@@ -1,0 +1,161 @@
+# Lighter-gated gap-write path — sibling to intake.yml, NOT a replacement for it.
+# Entry intake (intake.yml) lands canon via a human-merged PR. This lands a
+# gaps/ write via an AUTO-MERGED PR, because a gap record is working scratch
+# that updates every training session. The trade (no human in the merge) is only
+# safe because the write is sandboxed: a fresh short-lived App token, the same
+# injection/secret/moderation screening as entries, a server-derived path that
+# can only be under gaps/, append-only content, and an INDEPENDENT second check
+# (gap-diff-shape-check.yml) that must pass before auto-merge fires.
+#
+# Contributors never hold a git credential — same invariant as intake.yml. Only
+# the bot token commits, and only ever under gaps/.
+name: collective-gap-intake
+
+on:
+  issues:
+    types: [opened]
+
+permissions:
+  issues: write
+  contents: write
+  pull-requests: write
+
+concurrency:
+  # serialize gap writes so two runs can't race on the same file/sequence
+  group: gap-intake
+  cancel-in-progress: false
+
+jobs:
+  validate-and-commit:
+    if: contains(github.event.issue.labels.*.name, 'intake:gap')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Mint a short-lived bot token from the GitHub App
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.COLLECTIVE_BOT_APP_ID }}
+          private-key: ${{ secrets.COLLECTIVE_BOT_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: Collective
+
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+
+      - name: Write issue body to file
+        run: |
+          cat > /tmp/body.txt << 'ISSUE_BODY_EOF'
+          ${{ github.event.issue.body }}
+          ISSUE_BODY_EOF
+
+      - name: Fetch account age (for new-account extra scrutiny)
+        id: account
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          created_at=$(gh api "users/${{ github.event.issue.user.login }}" --jq .created_at)
+          echo "created_at=$created_at" >> "$GITHUB_OUTPUT"
+
+      - name: Load rate-limit state + list existing gaps
+        run: |
+          mkdir -p /tmp/state
+          cp gaps/_state/ratelimit.json /tmp/state/ratelimit.json 2>/dev/null || echo '{}' > /tmp/state/ratelimit.json
+          # Only lowercase-slug .md files are gaps; README/TEMPLATE/GAP_WRITE_PATH
+          # (uppercase) are excluded and can never be append targets anyway.
+          python3 - << 'PY' > /tmp/existing_gaps.json
+          import glob, json, os, re
+          slug = re.compile(r"^[a-z0-9][a-z0-9-]*\.md$")
+          names = [os.path.basename(p) for p in glob.glob("gaps/*.md")]
+          print(json.dumps([n for n in names if slug.match(n)]))
+          PY
+
+      - name: Run the gap steward
+        id: validate
+        run: |
+          python3 cli_gap.py \
+            --body-file /tmp/body.txt \
+            --login "${{ github.event.issue.user.login }}" \
+            --created-at "${{ steps.account.outputs.created_at }}" \
+            --existing-gaps-file /tmp/existing_gaps.json \
+            --ratelimit-file /tmp/state/ratelimit.json \
+            --form-file ".github/ISSUE_TEMPLATE/gap-log.yml" \
+            > /tmp/result.json
+          cat /tmp/result.json
+          echo "status=$(python3 -c "import json;print(json.load(open('/tmp/result.json'))['status'])")" >> "$GITHUB_OUTPUT"
+
+      - name: Moderation hold — never close, never echo content, route to human queue
+        if: steps.validate.outputs.status == 'moderation_hold'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          gh issue edit "${{ github.event.issue.number }}" --add-label "flagged:moderation"
+          gh issue comment "${{ github.event.issue.number }}" \
+            --body "This gap submission was routed to human moderation review. No action needed from you."
+
+      - name: Reject — comment specific reason, close
+        if: steps.validate.outputs.status == 'reject'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          reasons=$(python3 -c "import json;print('\n'.join('- ' + r for r in json.load(open('/tmp/result.json'))['reasons']))")
+          gh issue comment "${{ github.event.issue.number }}" --body "Automated gap check failed:
+          $reasons
+
+          Fix the issue above and open a new submission — this one won't be auto-retried."
+          gh issue close "${{ github.event.issue.number }}" --reason "not planned"
+
+      - name: Accept — write under gaps/ only, open an auto-merging PR
+        if: steps.validate.outputs.status == 'accept'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          set -e
+          filename=$(python3 -c "import json;print(json.load(open('/tmp/result.json'))['filename'])")
+
+          # Hard re-assertion of the path guard at the workflow layer: the write
+          # target must be a bare lowercase slug .md — never a path. Belt to the
+          # steward's braces; a bug or tampered result.json cannot escape gaps/.
+          echo "$filename" | grep -Eq '^[a-z0-9][a-z0-9-]*\.md$' || { echo "unsafe filename '$filename'"; exit 1; }
+
+          branch="gap/$(date +%s)"
+          git checkout -b "$branch"
+
+          python3 - << 'PY'
+          import json, os, re
+          r = json.load(open('/tmp/result.json'))
+          fn = r['filename']
+          path = os.path.join('gaps', fn)
+          assert os.path.dirname(os.path.abspath(path)) == os.path.abspath('gaps'), "escaped gaps/"
+          if r['operation'] == 'create':
+              assert not os.path.exists(path), "create target already exists"
+              open(path, 'w', encoding='utf-8').write(r['record_text'])
+          else:  # append
+              assert os.path.exists(path), "append target missing"
+              text = open(path, encoding='utf-8').read()
+              # advance the single Status header line (the one permitted modification)
+              text = re.sub(r'(?m)^- \*\*Status:\*\* .*$',
+                            f"- **Status:** {r['new_status']}", text, count=1)
+              if not text.endswith('\n'):
+                  text += '\n'
+              text += '\n' + r['record_text']
+              open(path, 'w', encoding='utf-8').write(text)
+          PY
+
+          cp /tmp/state/ratelimit.json gaps/_state/ratelimit.json
+
+          # Stage ONLY gaps/ — gap-diff-shape-check.yml independently re-asserts this.
+          git add "gaps/$filename" gaps/_state/ratelimit.json
+          git -c user.name="collective-gap-bot" -c user.email="collective-gap-bot@users.noreply.github.com" \
+            commit -m "gap($filename): #${{ github.event.issue.number }} from @${{ github.event.issue.user.login }}"
+          git push origin "$branch"
+
+          gh pr create --title "gap: ${filename}" \
+            --body "Mechanically validated gap write from #${{ github.event.issue.number }}. Auto-merges once gap-diff-shape-check passes." \
+            --label "gap:auto"
+          # Auto-merge: lands only after the independent diff-shape check is green.
+          # Requires branch protection on main requiring that check (see staging README).
+          gh pr merge --auto --squash
+          gh issue comment "${{ github.event.issue.number }}" \
+            --body "Passed automated checks — opened as an auto-merging pull request for the gaps folder."
+          gh issue close "${{ github.event.issue.number }}" --reason "completed"

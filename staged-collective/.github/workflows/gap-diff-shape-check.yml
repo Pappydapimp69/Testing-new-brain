@@ -1,0 +1,90 @@
+# Independent second check on every gap-intake PR, and the gate that makes
+# auto-merge safe. Sibling to diff-shape-check.yml. Verifies the diff is EXACTLY
+# what a well-behaved gap write produces — one gap file under gaps/ (plus its
+# rate-limit bookkeeping), append-only, nothing outside gaps/, no closure. A
+# subverted gap-intake run, or a bug, cannot smuggle a write past this actor.
+name: collective-gap-diff-shape-check
+
+on:
+  pull_request:
+    branches: [main]
+
+jobs:
+  gap-diff-shape:
+    if: startsWith(github.head_ref, 'gap/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Assert diff touches only gaps/, one gap file, append-only, no closure
+        run: |
+          set -e
+          changed=$(git diff --name-only origin/main...HEAD)
+          echo "Changed files:"; echo "$changed"
+
+          bad=0
+          gap_file=""
+          gap_count=0
+          while IFS= read -r f; do
+            [ -z "$f" ] && continue
+            case "$f" in
+              gaps/_state/ratelimit.json)
+                ;;
+              gaps/*.md)
+                # must be a bare lowercase-slug .md directly under gaps/
+                base="${f#gaps/}"
+                if echo "$base" | grep -Eq '^[a-z0-9][a-z0-9-]*\.md$'; then
+                  gap_file="$f"; gap_count=$((gap_count + 1))
+                else
+                  echo "UNEXPECTED gaps file (not a slug .md, or in a subdir): $f"; bad=1
+                fi
+                ;;
+              *)
+                echo "UNEXPECTED file outside gaps/: $f"; bad=1
+                ;;
+            esac
+          done <<< "$changed"
+
+          if [ "$gap_count" -ne 1 ]; then
+            echo "Expected exactly 1 gap file changed, found $gap_count"; bad=1
+          fi
+
+          # Append-only: at most ONE deleted line is allowed across the gap file
+          # (the single Status header line an append is permitted to advance). A
+          # brand-new file has zero deletions. Anything more means prior content
+          # was rewritten — not an append.
+          if [ -n "$gap_file" ]; then
+            deleted=$(git diff --numstat origin/main...HEAD -- "$gap_file" | awk '{print $2}')
+            deleted="${deleted:-0}"
+            if [ "$deleted" -gt 1 ]; then
+              echo "Gap file has $deleted deleted lines — not append-only (max 1, the Status line)"; bad=1
+            fi
+            # Never allow this path to write a closed status.
+            if git show "HEAD:$gap_file" | grep -Eiq '^\- \*\*Status:\*\* *closed'; then
+              echo "Gap file sets a closed status — this path can never close a gap"; bad=1
+            fi
+          fi
+
+          if [ "$bad" -ne 0 ]; then
+            echo "Gap diff-shape check FAILED."; exit 1
+          fi
+          echo "Gap diff-shape check passed."
+
+      - name: Re-run the same screening against the committed gap file
+        run: |
+          set -e
+          gap_file=$(git diff --name-only origin/main...HEAD -- 'gaps/*.md')
+          python3 -c "
+          import sys
+          sys.path.insert(0, '.')
+          from intake_steward import scan_injection, scan_secrets
+          text = open('$gap_file', encoding='utf-8').read()
+          hits = scan_injection(text) + scan_secrets(text)
+          if hits:
+              print('Re-validation found issues the first pass should have caught:')
+              for h in hits: print(' -', h)
+              sys.exit(1)
+          print('Re-validation clean.')
+          "
